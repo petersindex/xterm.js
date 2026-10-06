@@ -4,7 +4,7 @@
  */
 
 import { IDisposable } from '@xterm/xterm';
-import { IApcHandler, IImageAddonOptions, IResetHandler, ITerminalExt, ImageLayer } from '../Types';
+import { IApcHandler, IImageAddonOptions, IImageSpec, IResetHandler, ITerminalExt, ImageLayer } from '../Types';
 import { ImageRenderer } from '../ImageRenderer';
 import { CELL_SIZE_DEFAULT } from '../ImageStorage';
 import { KittyImageStorage } from './KittyImageStorage';
@@ -382,7 +382,7 @@ export class KittyGraphicsHandler implements IApcHandler, IResetHandler, IDispos
       this._sendResponse(id, 'ENOENT:image not found', cmd.quiet ?? 0, cmd.placementId);
       return true;
     }
-    const result = this._displayImage(image, cmd);
+    const result = cmd.unicodePlaceholder === 1 ? this._placeVirtually(image, cmd) : this._displayImage(image, cmd);
     return result.then(success => {
       this._sendResponse(id, success ? 'OK' : 'EINVAL:image rendering failed', cmd.quiet ?? 0, cmd.placementId);
       return true;
@@ -433,7 +433,7 @@ export class KittyGraphicsHandler implements IApcHandler, IResetHandler, IDispos
     const id = cmd.id ?? this._kittyStorage.lastImageId;
     const image = this._kittyStorage.getImage(id);
     if (image) {
-      const result = this._displayImage(image, cmd);
+      const result = cmd.unicodePlaceholder === 1 ? this._placeVirtually(image, cmd) : this._displayImage(image, cmd);
       if (cmd.id !== undefined) {
         return result.then(success => {
           this._sendResponse(id, success ? 'OK' : 'EINVAL:image rendering failed', cmd.quiet ?? 0);
@@ -542,6 +542,58 @@ export class KittyGraphicsHandler implements IApcHandler, IResetHandler, IDispos
   }
 
   // Image display
+
+  /**
+   * Creates a virtual placement (U=1): nothing is drawn at the cursor, and the
+   * cursor stays put. The image is fit, aspect kept and centred, into a
+   * canvas of exactly `c` x `r` cells, so each placeholder cell maps to one
+   * tile of it.
+   */
+  private _placeVirtually(image: IKittyImageData, cmd: IKittyCommand): Promise<boolean> {
+    return this._decodeVirtual(image, cmd)
+      .then(() => true)
+      .catch(() => false);
+  }
+
+  private async _decodeVirtual(image: IKittyImageData, cmd: IKittyCommand): Promise<void> {
+    const bitmap = await this._createBitmap(image);
+    try {
+      const cw = this._renderer.dimensions?.css.cell.width || CELL_SIZE_DEFAULT.width;
+      const ch = this._renderer.dimensions?.css.cell.height || CELL_SIZE_DEFAULT.height;
+      const cols = cmd.columns || Math.max(1, Math.ceil(bitmap.width / cw));
+      const rows = cmd.rows || Math.max(1, Math.ceil(bitmap.height / ch));
+      const boxWidth = Math.round(cols * cw);
+      const boxHeight = Math.round(rows * ch);
+      if (boxWidth * boxHeight > this._opts.pixelLimit) {
+        throw new Error('image exceeds pixel limit');
+      }
+      const placement = this._kittyStorage.addVirtualPlacement(image.id, cmd.placementId ?? 0, cols, rows);
+      const scale = Math.min(boxWidth / bitmap.width, boxHeight / bitmap.height);
+      const width = bitmap.width * scale;
+      const height = bitmap.height * scale;
+      const canvas = ImageRenderer.createCanvas(window.document, boxWidth, boxHeight);
+      const ctx = canvas.getContext('2d');
+      if (!ctx) {
+        throw new Error('Failed to create placeholder canvas context');
+      }
+      ctx.drawImage(bitmap, (boxWidth - width) / 2, (boxHeight - height) / 2, width, height);
+      const layer: ImageLayer = cmd.zIndex !== undefined && cmd.zIndex < 0 ? 'bottom' : 'top';
+      const spec: IImageSpec = {
+        orig: canvas,
+        origCellSize: { width: cw, height: ch },
+        actual: canvas,
+        actualCellSize: { width: cw, height: ch },
+        marker: undefined,
+        tileCount: cols * rows,
+        bufferType: this._coreTerminal.buffer.active.type,
+        layer,
+        zIndex: cmd.zIndex ?? 0
+      };
+      this._kittyStorage.setPlaceholderImage(placement, spec);
+    } finally {
+      bitmap.close();
+    }
+  }
 
   private _displayImage(image: IKittyImageData, cmd: IKittyCommand): Promise<boolean> {
     return this._decodeAndDisplay(image, cmd)

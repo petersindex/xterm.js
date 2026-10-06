@@ -5,7 +5,7 @@
 
 import { IDisposable } from '@xterm/xterm';
 import { ImageStorage } from '../ImageStorage';
-import { ImageLayer, IAddImageOpts } from '../Types';
+import { ImageLayer, IAddImageOpts, IImageSpec, IPlaceholderImage, IPlaceholderImages } from '../Types';
 import { IKittyImageData } from './KittyGraphicsTypes';
 
 // Kitty-specific image storage controller.
@@ -15,7 +15,7 @@ import { IKittyImageData } from './KittyGraphicsTypes';
 // - tracks kitty image id -> shared ImageStorage id mapping for displayed images
 // - mirrors shared-storage evictions into kitty maps
 // - applies protocol-level undisplayed-image eviction policy
-export class KittyImageStorage implements IDisposable {
+export class KittyImageStorage implements IDisposable, IPlaceholderImages {
   private static readonly _maxStoredImages = 256;
 
   private _nextImageId = 1;
@@ -31,6 +31,9 @@ export class KittyImageStorage implements IDisposable {
   // support multiple entries per logical image.
   private readonly _kittyIdToStorageId: Map<number, number> = new Map();
   private readonly _storageIdToKittyId: Map<number, number> = new Map();
+  // Virtual placements (U=1), by kitty image id then placement id. They have
+  // no position of their own: placeholder cells name them where they show.
+  private readonly _virtual: Map<number, Map<number, IPlaceholderImage>> = new Map();
 
   private readonly _previousOnImageDeleted: ((storageId: number) => void) | undefined;
   private readonly _wrappedOnImageDeleted: (storageId: number) => void;
@@ -53,11 +56,13 @@ export class KittyImageStorage implements IDisposable {
       this._handleStorageImageDeleted(storageId);
     };
     this._storage.onImageDeleted = this._wrappedOnImageDeleted;
+    this._storage.placeholderImages = this;
   }
 
   public reset(): void {
     this._nextImageId = 1;
     this._images.clear();
+    this._virtual.clear();
     this._kittyIdToStorageId.clear();
     this._storageIdToKittyId.clear();
   }
@@ -66,6 +71,9 @@ export class KittyImageStorage implements IDisposable {
     this.reset();
     if (this._storage.onImageDeleted === this._wrappedOnImageDeleted) {
       this._storage.onImageDeleted = this._previousOnImageDeleted;
+    }
+    if (this._storage.placeholderImages === this) {
+      this._storage.placeholderImages = undefined;
     }
   }
 
@@ -113,6 +121,9 @@ export class KittyImageStorage implements IDisposable {
 
   public deleteById(kittyId: number): void {
     this._images.delete(kittyId);
+    if (this._virtual.delete(kittyId)) {
+      this._storage.requestRedraw();
+    }
     const storageId = this._kittyIdToStorageId.get(kittyId);
     if (storageId !== undefined) {
       this._storage.deleteImage(storageId);
@@ -128,6 +139,54 @@ export class KittyImageStorage implements IDisposable {
     }
     this._kittyIdToStorageId.clear();
     this._storageIdToKittyId.clear();
+  }
+
+  /**
+   * Records a virtual placement of `cols` x `rows` cells. Its picture comes
+   * later through `setPlaceholderImage`, once decoded.
+   */
+  public addVirtualPlacement(kittyId: number, placementId: number, cols: number, rows: number): IPlaceholderImage {
+    let placements = this._virtual.get(kittyId);
+    if (!placements) {
+      placements = new Map();
+      this._virtual.set(kittyId, placements);
+    }
+    const placement: IPlaceholderImage = { spec: undefined, cols, rows };
+    placements.set(placementId, placement);
+    return placement;
+  }
+
+  /** Hands a virtual placement its decoded picture and redraws placeholders. */
+  public setPlaceholderImage(placement: IPlaceholderImage, spec: IImageSpec): void {
+    placement.spec = spec;
+    this._storage.requestRedraw();
+  }
+
+  public get size(): number {
+    return this._virtual.size;
+  }
+
+  public hasLayer(layer: ImageLayer): boolean {
+    for (const placements of this._virtual.values()) {
+      for (const placement of placements.values()) {
+        if (placement.spec?.layer === layer) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  public get(imageId: number, placementId: number): IPlaceholderImage | undefined {
+    const placements = this._virtual.get(imageId);
+    if (!placements) {
+      return undefined;
+    }
+    if (placementId) {
+      return placements.get(placementId);
+    }
+    // Placement id 0: the terminal may choose any virtual placement.
+    return placements.get(0) ?? placements.values().next().value;
   }
 
   public get images(): ReadonlyMap<number, IKittyImageData> {
@@ -147,7 +206,7 @@ export class KittyImageStorage implements IDisposable {
       if (this._images.size <= KittyImageStorage._maxStoredImages / 2) {
         break;
       }
-      if (!this._kittyIdToStorageId.has(kittyId)) {
+      if (!this._kittyIdToStorageId.has(kittyId) && !this._virtual.has(kittyId)) {
         this._images.delete(kittyId);
       }
     }

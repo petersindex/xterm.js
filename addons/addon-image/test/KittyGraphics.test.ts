@@ -102,7 +102,6 @@ test.afterAll(async () => await ctx.page.close());
 
 test.describe('Kitty Graphics Protocol', () => {
   // TODO: Add tests for larger images with various dimensions
-  // TODO: Add tests for virtual placement (U=1)
   // TODO: Add tests for animation frames
   // TODO: Add performance tests for streaming large images
   // TODO: Implement cursor movement per Kitty spec - cursor should move by cols/rows after placement (unless C=1)
@@ -115,6 +114,80 @@ test.describe('Kitty Graphics Protocol', () => {
       window.imageAddon = new ImageAddon({ sixelPaletteLimit: 512 });
       window.term.loadAddon(window.imageAddon);
     `);
+  });
+
+  test.describe('Unicode placeholders (U=1)', () => {
+    // Placeholder character and the diacritics for 0 and 1.
+    const P = String.fromCodePoint(0x10EEEE);
+    const D0 = '̅';
+    const D1 = '̍';
+    // 2x2 placeholder for image id 42 in 256-colour mode, as in the kitty spec.
+    const GRID_2X2 = `\x1b[38;5;42m${P}${D0}${D0}${P}${D0}${D1}\x1b[39m\r\n\x1b[38;5;42m${P}${D1}${D0}${P}${D1}${D1}\x1b[39m`;
+
+    // Where each quadrant of a 2x2 image lands once fit, aspect kept, into
+    // 2x2 cells: a square of two cell widths, centred top to bottom.
+    async function quadrantCentres(): Promise<{ red: [number, number], yellow: [number, number], above: [number, number] }> {
+      const { cellWidth, cellHeight } = await getDimensions();
+      const side = Math.min(2 * cellWidth, 2 * cellHeight);
+      const top = (2 * cellHeight - side) / 2;
+      const left = (2 * cellWidth - side) / 2;
+      return {
+        red: [left + side / 4, top + side / 4],
+        yellow: [left + 3 * side / 4, top + 3 * side / 4],
+        above: [cellWidth / 2, Math.max(0, top / 2)]
+      };
+    }
+
+    test('a virtual placement draws nothing at the cursor and keeps the cursor still', async () => {
+      await ctx.proxy.write(`\x1b_Ga=T,U=1,f=24,s=2,v=2,i=42,c=2,r=2,q=2;${RAW_RGB_2X2}\x1b\\`);
+      await timeout(100);
+      strictEqual(await getImageStorageLength(), 0);
+      deepStrictEqual(await getCursor(), [0, 0]);
+    });
+
+    test('placeholder cells draw the image, fit with its aspect kept', async () => {
+      await ctx.proxy.write(`\x1b_Ga=T,U=1,f=24,s=2,v=2,i=42,c=2,r=2,q=2;${RAW_RGB_2X2}\x1b\\`);
+      await ctx.proxy.write(GRID_2X2);
+      await timeout(200);
+      const { red, yellow } = await quadrantCentres();
+      deepStrictEqual(await getLayerPixel(...red), [255, 0, 0, 255]);
+      deepStrictEqual(await getLayerPixel(...yellow), [255, 255, 0, 255]);
+    });
+
+    test('a placement made with a=p after a=t draws on its placeholders too', async () => {
+      await ctx.proxy.write(`\x1b_Ga=t,f=24,s=2,v=2,i=42,q=2;${RAW_RGB_2X2}\x1b\\`);
+      await ctx.proxy.write(`\x1b_Ga=p,U=1,i=42,c=2,r=2,q=2\x1b\\`);
+      await ctx.proxy.write(GRID_2X2);
+      await timeout(200);
+      const { red } = await quadrantCentres();
+      deepStrictEqual(await getLayerPixel(...red), [255, 0, 0, 255]);
+    });
+
+    test('placeholders written before the image arrives draw once it does', async () => {
+      await ctx.proxy.write(GRID_2X2);
+      await ctx.proxy.write(`\x1b_Ga=T,U=1,f=24,s=2,v=2,i=42,c=2,r=2,q=2;${RAW_RGB_2X2}\x1b\\`);
+      await timeout(200);
+      const { yellow } = await quadrantCentres();
+      deepStrictEqual(await getLayerPixel(...yellow), [255, 255, 0, 255]);
+    });
+
+    test('a virtual placement behind text (z<0) draws on the bottom layer', async () => {
+      await ctx.proxy.write(`\x1b_Ga=T,U=1,f=24,s=2,v=2,i=42,c=2,r=2,z=-1,q=2;${RAW_RGB_2X2}\x1b\\`);
+      await ctx.proxy.write(GRID_2X2);
+      await timeout(200);
+      const { red } = await quadrantCentres();
+      deepStrictEqual(await getLayerPixel(...red, 'bottom'), [255, 0, 0, 255]);
+    });
+
+    test('deleting the image clears its placeholders', async () => {
+      await ctx.proxy.write(`\x1b_Ga=T,U=1,f=24,s=2,v=2,i=42,c=2,r=2,q=2;${RAW_RGB_2X2}\x1b\\`);
+      await ctx.proxy.write(GRID_2X2);
+      await timeout(200);
+      await ctx.proxy.write(`\x1b_Ga=d,d=i,i=42\x1b\\`);
+      await timeout(200);
+      const { red } = await quadrantCentres();
+      deepStrictEqual(await getLayerPixel(...red), [0, 0, 0, 0]);
+    });
   });
 
   test.describe('Basic transmission and storage', () => {
@@ -2280,4 +2353,12 @@ async function getPixels(col: number, row: number, x: number, y: number, w: numb
 
 async function hasTileAtBufferCell(x: number, y: number): Promise<boolean> {
   return ctx.page.evaluate(`!!window.imageAddon.extractTileAtBufferCell(${x}, ${y})`);
+}
+
+async function getLayerPixel(x: number, y: number, layer: 'top' | 'bottom' = 'top'): Promise<number[]> {
+  return ctx.page.evaluate(([x, y, layer]: [number, number, string]) => {
+    const canvas = document.querySelector(`.xterm-image-layer-${layer}`) as HTMLCanvasElement | null;
+    if (!canvas) return [0, 0, 0, 0];
+    return Array.from(canvas.getContext('2d')!.getImageData(Math.floor(x), Math.floor(y), 1, 1).data);
+  }, [x, y, layer] as [number, number, string]);
 }

@@ -96,6 +96,25 @@ export interface IAddImageOpts {
   cursorPos: CursorPos;
 }
 
+/**
+ * Images shown through placeholder cells rather than placed at a position:
+ * kitty's virtual placements, drawn wherever U+10EEEE cells name them.
+ */
+export interface IPlaceholderImages {
+  readonly size: number;
+  /** Whether any decoded image here draws on `layer`. */
+  hasLayer(layer: ImageLayer): boolean;
+  /** The image a placeholder cell names; placement id 0 matches any. */
+  get(imageId: number, placementId: number): IPlaceholderImage | undefined;
+}
+
+export interface IPlaceholderImage {
+  /** Undefined until the image has been decoded. */
+  spec: IImageSpec | undefined;
+  cols: number;
+  rows: number;
+}
+
 export interface IImageSpec {
   orig: HTMLCanvasElement | ImageBitmap | undefined;
   origCellSize: ICellSize;

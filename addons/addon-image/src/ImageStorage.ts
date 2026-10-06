@@ -5,9 +5,11 @@
 
 import { IDisposable } from '@xterm/xterm';
 import { ImageRenderer } from './ImageRenderer';
-import type {
-  ITerminalExt, IImageAddonOptions, IImageSpec, ICellSize, IAddImageOpts
+import {
+  Attributes, type ITerminalExt, type IImageAddonOptions, type IImageSpec, type ICellSize, type IAddImageOpts,
+  type IPlaceholderImages
 } from './Types';
+import { PlaceholderRow, mayBePlaceholder } from './kitty/KittyPlaceholders';
 import type { IBufferLine } from 'common/buffer/Types';
 import { CellData } from 'common/buffer/CellData';
 
@@ -49,6 +51,9 @@ export class ImageStorage implements IDisposable {
   private _viewportMetrics: { cols: number, rows: number };
   public onImageAdded: (() => void) | undefined;
   public onImageDeleted: ((storageId: number) => void) | undefined;
+  // Images drawn wherever placeholder cells name them (kitty U=1).
+  public placeholderImages: IPlaceholderImages | undefined;
+  private _placeholderRow = new PlaceholderRow();
 
   constructor(
     private _terminal: ITerminalExt,
@@ -121,6 +126,14 @@ export class ImageStorage implements IDisposable {
       spec.orig.close();
     }
     this.onImageDeleted?.(id);
+  }
+
+  /**
+   * Redraw the whole viewport, as when a placeholder image changes.
+   */
+  public requestRedraw(): void {
+    this._fullyCleared = false;
+    this._terminal.refresh(0, this._terminal.rows - 1);
   }
 
   /**
@@ -278,8 +291,9 @@ export class ImageStorage implements IDisposable {
   // TODO: Should we move this to the ImageRenderer?
   public render(range: { start: number, end: number }): void {
     // Determine which layers have images
-    let hasTopImages = false;
-    let hasBottomImages = false;
+    const placeholders = this.placeholderImages?.size ? this.placeholderImages : undefined;
+    let hasTopImages = !!placeholders?.hasLayer('top');
+    let hasBottomImages = !!placeholders?.hasLayer('bottom');
     for (const spec of this._images.values()) {
       if (spec.layer === 'bottom') {
         hasBottomImages = true;
@@ -302,7 +316,7 @@ export class ImageStorage implements IDisposable {
     this._renderer.rescaleCanvas();
 
     // exit early if we dont have any images to test for
-    if (!this._images.size) {
+    if (!this._images.size && !placeholders) {
       if (!this._fullyCleared) {
         this._renderer.clearAll();
         this._fullyCleared = true;
@@ -349,7 +363,14 @@ export class ImageStorage implements IDisposable {
     for (let row = start; row <= end; ++row) {
       const line = buffer.lines.get(row + buffer.ydisp);
       if (!line) return;
+      this._placeholderRow.reset();
       for (let col = 0; col < cols; ++col) {
+        if (placeholders) {
+          if (mayBePlaceholder(line.getCodePoint(col)) && this._collectPlaceholder(placeholders, line, col, row, drawCalls)) {
+            continue;
+          }
+          this._placeholderRow.reset();
+        }
         const e = line.getExtended(col)?.payload;
         if (e instanceof ImageTileInfo) {
           const imageId = e.imageId;
@@ -400,6 +421,46 @@ export class ImageStorage implements IDisposable {
     for (const call of drawCalls) {
       this._renderer.draw(call.imgSpec, call.tileId, call.col, call.row, call.count);
     }
+  }
+
+  /**
+   * Reads one cell as a placeholder; when it names a known image, adds its
+   * tile to `drawCalls`, joined to the call on its left where they continue.
+   * @returns whether the cell is a placeholder at all
+   */
+  private _collectPlaceholder(
+    placeholders: IPlaceholderImages,
+    line: IBufferLine,
+    col: number,
+    row: number,
+    drawCalls: { imgSpec: IImageSpec, tileId: number, col: number, row: number, count: number }[]
+  ): boolean {
+    const cell = this._workCell;
+    line.loadCell(col, cell);
+    // The image id rides the foreground colour, the placement id the underline colour.
+    if (cell.isFgDefault()) {
+      return false;
+    }
+    const placementId = cell.hasExtendedAttrs() && ~cell.extended.underlineColor && (cell.extended.underlineColor & Attributes.CM_MASK)
+      ? cell.getUnderlineColor()
+      : 0;
+    const resolved = this._placeholderRow.next(cell.getChars(), cell.getFgColor(), placementId);
+    if (!resolved) {
+      return false;
+    }
+    const image = placeholders.get(resolved.imageId, resolved.placementId);
+    if (!image?.spec?.actual || resolved.row >= image.rows || resolved.col >= image.cols) {
+      return true;
+    }
+    const tileId = resolved.row * image.cols + resolved.col;
+    const last = drawCalls[drawCalls.length - 1];
+    if (last && last.imgSpec === image.spec && last.row === row && last.col + last.count === col && last.tileId + last.count === tileId) {
+      last.count++;
+    } else {
+      drawCalls.push({ imgSpec: image.spec, tileId, col, row, count: 1 });
+    }
+    this._fullyCleared = false;
+    return true;
   }
 
   public viewportResize(metrics: { cols: number, rows: number }): void {
